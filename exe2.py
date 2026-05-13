@@ -3,24 +3,32 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 
+
+# =====================================================
+# CONFIGURAÇÃO DA PÁGINA
+# =====================================================
 st.set_page_config(
-    page_title="AHP Gaussiano - Escolha de Produto",
+    page_title="AHP Gaussiano - Decisão de Compra",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-st.title("🧠 Método AHP Gaussiano - Decisão de Compra")
+st.title("🧠 Método AHP-Gaussiano - Decisão de Compra")
 
 st.markdown("""
-Esta aplicação implementa o **Método AHP Gaussiano** para apoio à decisão multicritério.
+Aplicação do **Método AHP-Gaussiano** para apoio à decisão multicritério.
 
-Os pesos dos critérios são calculados objetivamente pela dispersão dos dados, usando o
-**Coeficiente de Variação**, reduzindo a subjetividade do AHP tradicional.
+O método calcula os pesos dos critérios a partir da própria matriz de decisão,
+usando o **Fator Gaussiano**, representado pelo coeficiente de variação:
+
+`FG = σ / μ`
+
+Depois, os fatores gaussianos são normalizados para formar os pesos dos critérios.
 """)
 
 
 # =====================================================
-# 1. BASE PADRÃO
+# BASE PADRÃO
 # =====================================================
 def carregar_dados_padrao():
     return pd.DataFrame({
@@ -43,9 +51,218 @@ if "dados_produtos" not in st.session_state:
 
 
 # =====================================================
-# 2. CONTROLES
+# FUNÇÕES AUXILIARES
 # =====================================================
-col_a, col_b = st.columns([1, 3])
+def converter_numero(valor):
+    if pd.isna(valor):
+        return np.nan
+
+    valor = str(valor).strip().replace(" ", "")
+
+    if valor == "":
+        return np.nan
+
+    if "." in valor and "," in valor:
+        valor = valor.replace(".", "").replace(",", ".")
+    else:
+        valor = valor.replace(",", ".")
+
+    try:
+        return float(valor)
+    except ValueError:
+        return np.nan
+
+
+def validar_dados(df, criterios):
+    erros = []
+
+    if df.empty:
+        erros.append("Nenhum produto válido encontrado.")
+
+    if len(df) < 2:
+        erros.append("O método exige pelo menos duas alternativas.")
+
+    for criterio in criterios:
+        if criterio not in df.columns:
+            erros.append(f"Critério ausente na matriz: {criterio}")
+
+    for criterio in criterios:
+        if criterio in df.columns and df[criterio].isna().any():
+            erros.append(f"O critério {criterio} possui valores vazios ou inválidos.")
+
+    return erros
+
+
+def preparar_matriz_decisao(df, criterios, tipo_criterio):
+    """
+    Etapa anterior à normalização.
+
+    Para critérios 'Maior é melhor':
+        usa o valor original.
+
+    Para critérios 'Menor é melhor':
+        aplica transformação inversa 1/x.
+
+    Observação:
+    O AHP-Gaussiano trabalha com direção MAX na matriz normalizada.
+    Portanto, critérios de minimização precisam ser convertidos antes.
+    """
+
+    matriz = df[criterios].copy().astype(float)
+
+    alertas = []
+
+    for criterio in criterios:
+        direcao = tipo_criterio[criterio]
+
+        if "Menor" in direcao:
+            if (matriz[criterio] <= 0).any():
+                alertas.append(
+                    f"O critério '{criterio}' possui valor menor ou igual a zero. "
+                    "Não é possível aplicar 1/x com segurança."
+                )
+
+            matriz[criterio] = np.where(
+                matriz[criterio] > 0,
+                1 / matriz[criterio],
+                np.nan
+            )
+
+    return matriz, alertas
+
+
+def normalizar_por_soma(matriz):
+    """
+    Normalização:
+        r_ij = x_ij / soma(x_j)
+    """
+
+    matriz_norm = pd.DataFrame(index=matriz.index)
+
+    for col in matriz.columns:
+        soma = matriz[col].sum(skipna=True)
+
+        if pd.isna(soma) or soma == 0:
+            matriz_norm[col] = np.nan
+        else:
+            matriz_norm[col] = matriz[col] / soma
+
+    return matriz_norm
+
+
+def calcular_ahp_gaussiano(df, criterios, tipo_criterio, id_col="Marca"):
+    matriz_original = df[criterios].copy().astype(float)
+
+    matriz_ajustada, alertas_direcao = preparar_matriz_decisao(
+        df=df,
+        criterios=criterios,
+        tipo_criterio=tipo_criterio
+    )
+
+    if matriz_ajustada.isna().any().any():
+        raise ValueError(
+            "A matriz ajustada possui valores inválidos. "
+            "Verifique zeros em critérios configurados como 'Menor é melhor'."
+        )
+
+    matriz_norm = normalizar_por_soma(matriz_ajustada)
+
+    if matriz_norm.isna().any().any():
+        raise ValueError(
+            "A matriz normalizada possui valores inválidos. "
+            "Verifique critérios com soma igual a zero."
+        )
+
+    # Média das alternativas em cada critério
+    medias = matriz_norm[criterios].mean(axis=0)
+
+    # Desvio-padrão AMOSTRAL para aderir ao padrão DESVPAD usado nos exemplos acadêmicos
+    desvios = matriz_norm[criterios].std(axis=0, ddof=1)
+
+    # Fator Gaussiano
+    fator_gaussiano = desvios / medias.replace(0, np.nan)
+    fator_gaussiano = fator_gaussiano.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Peso normalizado do critério
+    soma_fg = fator_gaussiano.sum()
+
+    if soma_fg > 0:
+        pesos = fator_gaussiano / soma_fg
+    else:
+        pesos = pd.Series(
+            [1 / len(criterios)] * len(criterios),
+            index=criterios
+        )
+
+    # Pontuação final das alternativas
+    contribuicoes = matriz_norm[criterios].mul(pesos, axis=1)
+    scores = contribuicoes.sum(axis=1)
+
+    resultado = df.copy()
+    resultado["Pontuação AHP-Gaussiano"] = scores.values
+    resultado["Ranking"] = (
+        resultado["Pontuação AHP-Gaussiano"]
+        .rank(ascending=False, method="dense")
+        .astype(int)
+    )
+
+    resultado["Classificação"] = np.select(
+        [
+            resultado["Ranking"] == 1,
+            resultado["Ranking"] == 2,
+            resultado["Ranking"] == 3
+        ],
+        [
+            "Melhor escolha",
+            "Segunda opção",
+            "Terceira opção"
+        ],
+        default="Alternativa complementar"
+    )
+
+    diagnostico = pd.DataFrame({
+        "Critério": criterios,
+        "Direção": [tipo_criterio[c] for c in criterios],
+        "Média Normalizada": medias.values,
+        "Desvio-Padrão Amostral (σ)": desvios.values,
+        "Fator Gaussiano (σ/μ)": fator_gaussiano.values,
+        "Peso Normalizado": pesos.values,
+        "Peso Calculado (%)": pesos.values * 100
+    }).sort_values(
+        "Peso Calculado (%)",
+        ascending=False
+    ).reset_index(drop=True)
+
+    contribuicoes.insert(0, id_col, df[id_col].values)
+    contribuicoes["Pontuação Total"] = scores.values
+
+    resultado = resultado.sort_values(
+        "Pontuação AHP-Gaussiano",
+        ascending=False
+    ).reset_index(drop=True)
+
+    matriz_norm_exib = matriz_norm.copy()
+    matriz_norm_exib.insert(0, id_col, df[id_col].values)
+
+    matriz_ajustada_exib = matriz_ajustada.copy()
+    matriz_ajustada_exib.insert(0, id_col, df[id_col].values)
+
+    return {
+        "resultado": resultado,
+        "diagnostico": diagnostico,
+        "matriz_original": matriz_original,
+        "matriz_ajustada": matriz_ajustada_exib,
+        "matriz_normalizada": matriz_norm_exib,
+        "contribuicoes": contribuicoes,
+        "pesos": pesos,
+        "alertas_direcao": alertas_direcao
+    }
+
+
+# =====================================================
+# CONTROLES
+# =====================================================
+col_a, col_b = st.columns([1, 4])
 
 with col_a:
     if st.button("🔄 Restaurar matriz padrão"):
@@ -54,13 +271,14 @@ with col_a:
 
 with col_b:
     st.info(
-        "Edite os dados, inclua novos produtos e ajuste a direção de preferência de cada critério. "
-        "Agora a coluna Pontuação também participa do cálculo final."
+        "Edite os produtos, altere os critérios e escolha se cada critério é de maximização "
+        "ou minimização. O cálculo seguirá a sequência: matriz ajustada → normalização → "
+        "média → desvio padrão → fator gaussiano → pesos → ranking."
     )
 
 
 # =====================================================
-# 3. MATRIZ DE DECISÃO
+# MATRIZ DE DECISÃO
 # =====================================================
 st.subheader("📋 Matriz de Decisão")
 
@@ -111,28 +329,8 @@ st.session_state["dados_produtos"] = df_editado.copy()
 
 
 # =====================================================
-# 4. TRATAMENTO DOS DADOS
+# TRATAMENTO DOS DADOS
 # =====================================================
-def converter_numero(valor):
-    if pd.isna(valor):
-        return np.nan
-
-    valor = str(valor).strip().replace(" ", "")
-
-    if valor == "":
-        return np.nan
-
-    if "." in valor and "," in valor:
-        valor = valor.replace(".", "").replace(",", ".")
-    else:
-        valor = valor.replace(",", ".")
-
-    try:
-        return float(valor)
-    except ValueError:
-        return np.nan
-
-
 df = df_editado.copy()
 
 df = df.dropna(subset=["Marca"])
@@ -152,7 +350,7 @@ for criterio in criterios:
 linhas_invalidas = df[df[criterios].isna().any(axis=1)]
 
 if not linhas_invalidas.empty:
-    st.warning("⚠️ Algumas linhas possuem valores numéricos inválidos ou vazios e serão ignoradas.")
+    st.warning("⚠️ Algumas linhas possuem valores inválidos e serão ignoradas.")
     st.dataframe(
         linhas_invalidas[["Produto", "Marca"] + criterios],
         use_container_width=True
@@ -160,17 +358,16 @@ if not linhas_invalidas.empty:
 
 df = df.dropna(subset=criterios).reset_index(drop=True)
 
-if df.empty:
-    st.error("❌ Nenhum produto válido encontrado.")
-    st.stop()
+erros_validacao = validar_dados(df, criterios)
 
-if len(df) < 2:
-    st.warning("⚠️ O AHP Gaussiano exige pelo menos dois produtos.")
+if erros_validacao:
+    for erro in erros_validacao:
+        st.error(f"❌ {erro}")
     st.stop()
 
 
 # =====================================================
-# 5. CONFIGURAÇÃO DOS CRITÉRIOS
+# CONFIGURAÇÃO DOS CRITÉRIOS
 # =====================================================
 st.subheader("⚙️ Configuração dos Critérios")
 
@@ -213,489 +410,361 @@ tipo_criterio = {
 
 
 # =====================================================
-# 6. CÁLCULO AHP GAUSSIANO
-# =====================================================
-def calcular_ahp_gaussiano(df, criterios, tipo_criterio, id_col="Marca"):
-
-    matriz = df[criterios].copy().astype(float)
-
-    matriz_original = matriz.copy()
-
-    for col in criterios:
-        if "Menor" in tipo_criterio[col]:
-            vals = matriz[col].replace(0, np.nan)
-            matriz[col] = 1.0 / vals
-            matriz[col] = matriz[col].fillna(matriz[col].max())
-
-    matriz_norm = pd.DataFrame(index=matriz.index)
-
-    for col in criterios:
-        soma = matriz[col].sum()
-
-        if soma > 0:
-            matriz_norm[col] = matriz[col] / soma
-        else:
-            matriz_norm[col] = 1.0 / len(matriz)
-
-    medias = matriz_norm[criterios].mean()
-    desvios = matriz_norm[criterios].std(ddof=0)
-
-    fator_gaussiano = (desvios / medias.replace(0, np.nan)).fillna(0)
-
-    if fator_gaussiano.sum() > 0:
-        pesos = fator_gaussiano / fator_gaussiano.sum()
-    else:
-        pesos = pd.Series(
-            [1 / len(criterios)] * len(criterios),
-            index=criterios
-        )
-
-    scores = matriz_norm[criterios].dot(pesos)
-
-    resultado = df.copy()
-    resultado["Pontuação AHP Gaussiano"] = scores.values
-
-    resultado["Ranking"] = (
-        resultado["Pontuação AHP Gaussiano"]
-        .rank(ascending=False, method="dense")
-        .astype(int)
-    )
-
-    resultado["Classificação"] = np.select(
-        [
-            resultado["Ranking"] == 1,
-            resultado["Ranking"] == 2,
-            resultado["Ranking"] == 3
-        ],
-        [
-            "Melhor escolha",
-            "Segunda opção",
-            "Terceira opção"
-        ],
-        default="Alternativa complementar"
-    )
-
-    diagnostico = pd.DataFrame({
-        "Critério": criterios,
-        "Tipo": [tipo_criterio[c] for c in criterios],
-        "Média Normalizada": medias.values,
-        "Desvio-Padrão (σ)": desvios.values,
-        "Fator Gaussiano (CV)": fator_gaussiano.values,
-        "Peso Calculado (%)": (pesos.values * 100).round(2),
-    }).sort_values(
-        "Peso Calculado (%)",
-        ascending=False
-    ).reset_index(drop=True)
-
-    contribuicoes = matriz_norm[criterios].mul(pesos, axis=1)
-    contribuicoes.insert(0, id_col, df[id_col].values)
-
-    resultado = resultado.sort_values(
-        "Pontuação AHP Gaussiano",
-        ascending=False
-    ).reset_index(drop=True)
-
-    return matriz_norm, matriz_original, pesos, resultado, diagnostico, contribuicoes
-
-
-# =====================================================
-# 7. EXECUÇÃO
+# EXECUTAR CÁLCULO
 # =====================================================
 st.subheader("🚀 Executar Cálculo")
 
-if st.button("Calcular AHP Gaussiano", type="primary"):
-    with st.spinner("Processando método AHP Gaussiano..."):
-        try:
-            (
-                matriz_norm,
-                matriz_original,
-                pesos,
-                resultado,
-                diagnostico,
-                contribuicoes
-            ) = calcular_ahp_gaussiano(
-                df,
-                criterios,
-                tipo_criterio
-            )
+if st.button("Calcular AHP-Gaussiano", type="primary"):
+    try:
+        resultado_calculo = calcular_ahp_gaussiano(
+            df=df,
+            criterios=criterios,
+            tipo_criterio=tipo_criterio
+        )
 
-            st.session_state.update({
-                "resultado_ahp": resultado,
-                "diagnostico_ahp": diagnostico,
-                "matriz_norm_ahp": matriz_norm,
-                "matriz_original_ahp": matriz_original,
-                "contribuicoes_ahp": contribuicoes,
-                "pesos_ahp": pesos
-            })
+        st.session_state["ahp_resultado_calculo"] = resultado_calculo
+        st.success("✅ Cálculo concluído com sucesso.")
+        st.rerun()
 
-            st.success("✅ Cálculo concluído com sucesso!")
-            st.rerun()
-
-        except Exception as e:
-            st.error(f"❌ Erro: {type(e).__name__}: {e}")
-            st.exception(e)
+    except Exception as e:
+        st.error(f"❌ Erro no cálculo: {type(e).__name__}: {e}")
+        st.exception(e)
 
 
 # =====================================================
-# 8. RESULTADOS
+# RESULTADOS
 # =====================================================
-if "resultado_ahp" in st.session_state:
+if "ahp_resultado_calculo" not in st.session_state:
+    st.info("👆 Clique em **Calcular AHP-Gaussiano** para visualizar os resultados.")
+    st.stop()
 
-    resultado = st.session_state["resultado_ahp"]
-    diagnostico = st.session_state["diagnostico_ahp"]
-    matriz_norm = st.session_state["matriz_norm_ahp"]
-    contribuicoes = st.session_state["contribuicoes_ahp"]
-    pesos = st.session_state["pesos_ahp"]
 
-    st.subheader("🏆 Resultado da Decisão")
+dados = st.session_state["ahp_resultado_calculo"]
 
-    melhor = resultado.iloc[0]
-    segundo = resultado.iloc[1] if len(resultado) > 1 else None
+resultado = dados["resultado"]
+diagnostico = dados["diagnostico"]
+matriz_normalizada = dados["matriz_normalizada"]
+matriz_ajustada = dados["matriz_ajustada"]
+contribuicoes = dados["contribuicoes"]
+pesos = dados["pesos"]
+alertas_direcao = dados["alertas_direcao"]
 
-    col1, col2, col3, col4, col5 = st.columns(5)
 
-    col1.metric("Produto recomendado", melhor["Marca"])
-    col2.metric("Pontuação AHP", f"{melhor['Pontuação AHP Gaussiano']:.4f}")
-    col3.metric("Nota do Produto", f"{melhor['Pontuação']:.2f}")
-    col4.metric("Ranking", f"{melhor['Ranking']}º")
+# =====================================================
+# RESULTADO EXECUTIVO
+# =====================================================
+st.subheader("🏆 Resultado da Decisão")
 
-    if segundo is not None:
-        diff = melhor["Pontuação AHP Gaussiano"] - segundo["Pontuação AHP Gaussiano"]
-        col5.metric("Vantagem sobre 2º", f"{diff:.4f}")
-    else:
-        col5.metric("Vantagem sobre 2º", "-")
+melhor = resultado.iloc[0]
+segundo = resultado.iloc[1] if len(resultado) > 1 else None
 
-    st.success(
-        f"✅ Pelo método AHP Gaussiano, o produto mais indicado é "
-        f"**{melhor['Marca']}**, com pontuação final de "
-        f"**{melhor['Pontuação AHP Gaussiano']:.4f}**."
-    )
+col1, col2, col3, col4, col5 = st.columns(5)
 
-    crit_principal = diagnostico.loc[0, "Critério"]
-    peso_principal = diagnostico.loc[0, "Peso Calculado (%)"]
+col1.metric("Produto recomendado", melhor["Marca"])
+col2.metric("Pontuação final", f"{melhor['Pontuação AHP-Gaussiano']:.4f}")
+col3.metric("Ranking", f"{melhor['Ranking']}º")
+col4.metric("Nota do produto", f"{melhor['Pontuação']:.2f}")
 
-    if segundo is not None:
-        diff = melhor["Pontuação AHP Gaussiano"] - segundo["Pontuação AHP Gaussiano"]
-
-        if diff < 0.02:
-            intensidade = "muito pequena"
-            recomendacao = "⚠️ Recomenda-se revisar os critérios ou incluir novos dados."
-        elif diff < 0.08:
-            intensidade = "moderada"
-            recomendacao = "✅ Existe vantagem moderada para o primeiro colocado."
-        else:
-            intensidade = "alta"
-            recomendacao = "✅ Existe vantagem clara para o primeiro colocado."
-
-        st.markdown(f"""
-        **📚 Interpretação Acadêmica**
-
-        O produto **{melhor['Marca']}** ficou à frente de **{segundo['Marca']}**
-        por uma diferença **{intensidade}** de **{diff:.4f}** ponto(s).
-
-        O critério com maior influência foi **{crit_principal}**, com peso objetivo de
-        **{peso_principal:.2f}%**.
-
-        {recomendacao}
-        """)
-
-    st.subheader("📊 Ranking Final")
-
-    cols_exib = [
-        "Ranking",
-        "Marca",
-        "Classificação",
-        "Pontuação AHP Gaussiano"
-    ] + criterios
-
-    st.dataframe(
-        resultado[cols_exib].round(4),
-        use_container_width=True
-    )
-
-    fig_rank = px.bar(
-        resultado.sort_values("Pontuação AHP Gaussiano"),
-        x="Marca",
-        y="Pontuação AHP Gaussiano",
-        text_auto=".4f",
-        title="Pontuação Final por Produto",
-        color="Pontuação AHP Gaussiano",
-        color_continuous_scale="Viridis"
-    )
-
-    fig_rank.update_layout(
-        showlegend=False,
-        yaxis_title="Pontuação AHP",
-        xaxis_title="Produto"
-    )
-
-    st.plotly_chart(fig_rank, use_container_width=True)
-
-
-    # =====================================================
-    # PESOS
-    # =====================================================
-    st.subheader("⚖️ Pesos Calculados dos Critérios")
-
-    st.dataframe(
-        diagnostico.round(4),
-        use_container_width=True
-    )
-
-    fig_pesos = px.bar(
-        diagnostico,
-        x="Critério",
-        y="Peso Calculado (%)",
-        text_auto=".1f",
-        title="Peso Objetivo de Cada Critério",
-        color="Peso Calculado (%)",
-        color_continuous_scale="Blues"
-    )
-
-    fig_pesos.update_layout(
-        showlegend=False,
-        yaxis_title="Peso (%)"
-    )
-
-    st.plotly_chart(fig_pesos, use_container_width=True)
-
-    cv_valor = diagnostico.loc[0, "Fator Gaussiano (CV)"]
-
-    st.markdown(
-        f"> **🔍 Leitura metodológica:** o critério **{crit_principal}** recebeu o maior peso "
-        f"porque apresentou maior coeficiente de variação "
-        f"**σ/μ = {cv_valor:.4f}**, indicando maior poder de discriminação entre os produtos."
-    )
-
-
-    # =====================================================
-    # MATRIZ NORMALIZADA
-    # =====================================================
-    with st.expander("📐 Ver Matriz Normalizada"):
-        df_norm_exib = matriz_norm.copy()
-        df_norm_exib.insert(0, "Marca", df["Marca"].values)
-
-        st.dataframe(
-            df_norm_exib.round(4),
-            use_container_width=True
-        )
-
-        st.caption("Normalização por soma: rᵢⱼ = xᵢⱼ / Σxᵢⱼ")
-
-
-    # =====================================================
-    # CONTRIBUIÇÕES
-    # =====================================================
-    st.subheader("🧩 Contribuição de Cada Critério na Pontuação")
-
-    contrib_exib = contribuicoes.copy()
-    contrib_exib["Pontuação Total"] = contrib_exib[criterios].sum(axis=1)
-
-    st.dataframe(
-        contrib_exib.round(4),
-        use_container_width=True
-    )
-
-    fig_contrib = px.bar(
-        contrib_exib.sort_values("Pontuação Total"),
-        x="Marca",
-        y=criterios,
-        title="Composição da Pontuação Final por Critério",
-        barmode="stack"
-    )
-
-    st.plotly_chart(fig_contrib, use_container_width=True)
-
-
-    # =====================================================
-    # ANÁLISE DA PONTUAÇÃO
-    # =====================================================
-    st.subheader("⭐ Análise da Coluna Pontuação")
-
-    peso_pontuacao = pesos["Pontuação"] * 100
-    nota_media = resultado["Pontuação"].mean()
-    melhor_nota = resultado.loc[resultado["Pontuação"].idxmax()]
-
-    colp1, colp2, colp3 = st.columns(3)
-
-    colp1.metric("Peso da Pontuação", f"{peso_pontuacao:.2f}%")
-    colp2.metric("Nota média dos produtos", f"{nota_media:.2f}")
-    colp3.metric("Maior nota", f"{melhor_nota['Pontuação']:.2f}")
-
-    st.markdown(f"""
-    A coluna **Pontuação** foi tratada como critério qualitativo/estratégico.
-    Ela representa avaliação, reputação ou percepção de qualidade do produto.
-
-    Produto com maior nota: **{melhor_nota['Marca']}**, com **{melhor_nota['Pontuação']:.2f}**.
-
-    Peso calculado da Pontuação no modelo: **{peso_pontuacao:.2f}%**.
-    """)
-
-    if peso_pontuacao >= 30:
-        st.info(
-            "A Pontuação teve influência alta na decisão. "
-            "Isso indica que a diferença de avaliação entre os produtos foi relevante."
-        )
-    elif peso_pontuacao >= 15:
-        st.info(
-            "A Pontuação teve influência moderada. "
-            "Ela ajudou na decisão, mas não dominou o resultado."
-        )
-    else:
-        st.info(
-            "A Pontuação teve baixa influência. "
-            "As notas dos produtos estão próximas ou outros critérios discriminaram melhor."
-        )
-
-
-    # =====================================================
-    # POR QUE VENCEU
-    # =====================================================
-    st.subheader("🔎 Por que este produto venceu?")
-
-    contrib_vencedor = contrib_exib[
-        contrib_exib["Marca"] == melhor["Marca"]
-    ].iloc[0]
-
-    top_contrib = contrib_vencedor[criterios].sort_values(ascending=False)
-
-    st.markdown(f"""
-    **{melhor['Marca']}** venceu porque apresentou o melhor equilíbrio ponderado entre os critérios.
-
-    | Critério | Contribuição | Peso do Critério |
-    |---|---:|---:|
-    | **{top_contrib.index[0]}** | {top_contrib.iloc[0]:.4f} | {pesos[top_contrib.index[0]] * 100:.2f}% |
-    | **{top_contrib.index[1]}** | {top_contrib.iloc[1]:.4f} | {pesos[top_contrib.index[1]] * 100:.2f}% |
-    | **{top_contrib.index[2]}** | {top_contrib.iloc[2]:.4f} | {pesos[top_contrib.index[2]] * 100:.2f}% |
-    | **{top_contrib.index[3]}** | {top_contrib.iloc[3]:.4f} | {pesos[top_contrib.index[3]] * 100:.2f}% |
-
-    Um produto não precisa ser o melhor em todos os critérios.
-    Ele precisa ser competitivo nos critérios que mais diferenciam as alternativas.
-    """)
-
-
-    # =====================================================
-    # ALERTAS
-    # =====================================================
-    st.subheader("⚠️ Alertas de Qualidade dos Dados")
-
-    alertas = []
-
-    for crit in criterios:
-        if df[crit].nunique() == 1:
-            alertas.append(
-                f"`{crit}` possui o mesmo valor para todos os produtos e não discrimina alternativas."
-            )
-
-    pesos_array = np.array(list(pesos.values))
-
-    if pesos_array.max() > 0.70:
-        crit_max = pesos.idxmax()
-        alertas.append(
-            f"O critério `{crit_max}` concentra {pesos_array.max() * 100:.2f}% do peso. "
-            "A decisão está muito dependente desse critério."
-        )
-
-    if segundo is not None:
-        diff = melhor["Pontuação AHP Gaussiano"] - segundo["Pontuação AHP Gaussiano"]
-
-        if diff < 0.02:
-            alertas.append(
-                "Diferença muito pequena entre 1º e 2º colocado. "
-                "Pode ser necessário incluir novos critérios."
-            )
-
-    if resultado["Pontuação"].min() < 3:
-        alertas.append(
-            "Existe produto com Pontuação abaixo de 3. "
-            "Avalie se ele deveria continuar na análise."
-        )
-
-    if alertas:
-        for alerta in alertas:
-            st.warning(f"⚠️ {alerta}")
-    else:
-        st.info("✅ Nenhum alerta crítico encontrado.")
-
-
-    # =====================================================
-    # METODOLOGIA
-    # =====================================================
-    with st.expander("🧮 Como funciona o AHP Gaussiano"):
-        st.markdown("""
-        ## Método AHP Gaussiano
-
-        O AHP Gaussiano calcula pesos de forma objetiva usando a variabilidade dos dados.
-
-        ### Etapas
-
-        **1. Definição dos critérios**
-
-        São definidos critérios de decisão, como:
-
-        - Custo
-        - Quantidade
-        - Benefício Extra
-        - Pontuação
-
-        **2. Direção de preferência**
-
-        Cada critério pode ser configurado como:
-
-        - Maior é melhor
-        - Menor é melhor
-
-        Critérios do tipo “menor é melhor” são invertidos usando:
-
-        ```
-        x' = 1 / x
-        ```
-
-        **3. Normalização**
-
-        Os dados são normalizados por soma:
-
-        ```
-        rᵢⱼ = xᵢⱼ / Σxᵢⱼ
-        ```
-
-        **4. Fator Gaussiano**
-
-        Para cada critério, calcula-se:
-
-        ```
-        FGⱼ = σⱼ / μⱼ
-        ```
-
-        Onde:
-
-        - σ = desvio-padrão
-        - μ = média
-
-        **5. Peso do critério**
-
-        ```
-        wⱼ = FGⱼ / ΣFGⱼ
-        ```
-
-        **6. Pontuação final**
-
-        ```
-        Sᵢ = Σ(rᵢⱼ × wⱼ)
-        ```
-
-        O produto com maior `Sᵢ` é o mais recomendado.
-        """)
-
+if segundo is not None:
+    diferenca = melhor["Pontuação AHP-Gaussiano"] - segundo["Pontuação AHP-Gaussiano"]
+    col5.metric("Vantagem sobre 2º", f"{diferenca:.4f}")
 else:
-    st.info("👆 Clique em **Calcular AHP Gaussiano** para visualizar os resultados.")
+    diferenca = np.nan
+    col5.metric("Vantagem sobre 2º", "-")
+
+st.success(
+    f"✅ O produto recomendado pelo método AHP-Gaussiano é "
+    f"**{melhor['Marca']}**, com pontuação final de "
+    f"**{melhor['Pontuação AHP-Gaussiano']:.4f}**."
+)
+
+criterio_principal = diagnostico.iloc[0]["Critério"]
+peso_principal = diagnostico.iloc[0]["Peso Calculado (%)"]
+fg_principal = diagnostico.iloc[0]["Fator Gaussiano (σ/μ)"]
+
+st.markdown(f"""
+### Leitura técnica
+
+O critério com maior influência foi **{criterio_principal}**, com peso de
+**{peso_principal:.2f}%**.
+
+Isso ocorreu porque ele apresentou o maior **Fator Gaussiano**:
+
+`σ / μ = {fg_principal:.4f}`
+
+Ou seja, foi o critério que mais diferenciou as alternativas na matriz normalizada.
+""")
+
+
+# =====================================================
+# RANKING FINAL
+# =====================================================
+st.subheader("📊 Ranking Final")
+
+cols_ranking = [
+    "Ranking",
+    "Marca",
+    "Classificação",
+    "Pontuação AHP-Gaussiano"
+] + criterios
+
+st.dataframe(
+    resultado[cols_ranking].round(4),
+    use_container_width=True
+)
+
+fig_rank = px.bar(
+    resultado.sort_values("Pontuação AHP-Gaussiano"),
+    x="Marca",
+    y="Pontuação AHP-Gaussiano",
+    text="Pontuação AHP-Gaussiano",
+    title="Pontuação Final por Produto",
+    color="Pontuação AHP-Gaussiano",
+    color_continuous_scale="Viridis"
+)
+
+fig_rank.update_traces(
+    texttemplate="%{text:.4f}",
+    textposition="outside"
+)
+
+fig_rank.update_layout(
+    showlegend=False,
+    yaxis_title="Pontuação final",
+    xaxis_title="Produto"
+)
+
+st.plotly_chart(fig_rank, use_container_width=True)
+
+
+# =====================================================
+# PESOS DOS CRITÉRIOS
+# =====================================================
+st.subheader("⚖️ Pesos Calculados dos Critérios")
+
+st.dataframe(
+    diagnostico.round(6),
+    use_container_width=True
+)
+
+fig_pesos = px.bar(
+    diagnostico,
+    x="Critério",
+    y="Peso Calculado (%)",
+    text="Peso Calculado (%)",
+    title="Peso Objetivo dos Critérios",
+    color="Peso Calculado (%)",
+    color_continuous_scale="Blues"
+)
+
+fig_pesos.update_traces(
+    texttemplate="%{text:.2f}%",
+    textposition="outside"
+)
+
+fig_pesos.update_layout(
+    showlegend=False,
+    yaxis_title="Peso (%)",
+    xaxis_title="Critério"
+)
+
+st.plotly_chart(fig_pesos, use_container_width=True)
+
+
+# =====================================================
+# MATRIZES DO MÉTODO
+# =====================================================
+st.subheader("📐 Matrizes do Cálculo")
+
+with st.expander("1️⃣ Matriz ajustada pela direção de preferência"):
+    st.dataframe(
+        matriz_ajustada.round(6),
+        use_container_width=True
+    )
+
+    st.caption(
+        "Critérios do tipo 'Menor é melhor' são convertidos por 1/x antes da normalização."
+    )
+
+with st.expander("2️⃣ Matriz normalizada"):
+    st.dataframe(
+        matriz_normalizada.round(6),
+        use_container_width=True
+    )
+
+    st.caption(
+        "Normalização por soma: rᵢⱼ = xᵢⱼ / Σxᵢⱼ"
+    )
+
+
+# =====================================================
+# CONTRIBUIÇÕES
+# =====================================================
+st.subheader("🧩 Contribuição de Cada Critério na Pontuação")
+
+st.dataframe(
+    contribuicoes.round(6),
+    use_container_width=True
+)
+
+fig_contrib = px.bar(
+    contribuicoes.sort_values("Pontuação Total"),
+    x="Marca",
+    y=criterios,
+    title="Composição da Pontuação Final por Critério",
+    barmode="stack"
+)
+
+fig_contrib.update_layout(
+    yaxis_title="Contribuição na pontuação",
+    xaxis_title="Produto"
+)
+
+st.plotly_chart(fig_contrib, use_container_width=True)
+
+
+# =====================================================
+# POR QUE O PRODUTO VENCEU
+# =====================================================
+st.subheader("🔎 Por que este produto venceu?")
+
+contrib_vencedor = contribuicoes[
+    contribuicoes["Marca"] == melhor["Marca"]
+].iloc[0]
+
+top_contrib = contrib_vencedor[criterios].sort_values(ascending=False)
+
+df_top = pd.DataFrame({
+    "Critério": top_contrib.index,
+    "Contribuição": top_contrib.values,
+    "Peso do Critério (%)": [pesos[c] * 100 for c in top_contrib.index]
+})
+
+st.markdown(
+    f"**{melhor['Marca']}** venceu porque obteve a maior soma ponderada "
+    f"na matriz normalizada."
+)
+
+st.dataframe(
+    df_top.round(6),
+    use_container_width=True
+)
+
+st.info(
+    "No AHP-Gaussiano, uma alternativa não precisa ser a melhor em todos os critérios. "
+    "Ela precisa performar bem principalmente nos critérios com maior dispersão, pois são eles "
+    "que recebem maior peso objetivo."
+)
+
+
+# =====================================================
+# ALERTAS DE QUALIDADE
+# =====================================================
+st.subheader("⚠️ Alertas de Qualidade dos Dados")
+
+alertas = []
+
+for alerta in alertas_direcao:
+    alertas.append(alerta)
+
+for criterio in criterios:
+    if df[criterio].nunique() == 1:
+        alertas.append(
+            f"O critério '{criterio}' possui o mesmo valor para todas as alternativas. "
+            "Ele não discrimina os produtos."
+        )
+
+for _, row in diagnostico.iterrows():
+    if row["Peso Calculado (%)"] > 70:
+        alertas.append(
+            f"O critério '{row['Critério']}' concentra {row['Peso Calculado (%)']:.2f}% "
+            "do peso total. A decisão está muito dependente desse critério."
+        )
+
+if segundo is not None:
+    if diferenca < 0.02:
+        alertas.append(
+            "A diferença entre o 1º e o 2º colocado é muito pequena. "
+            "Recomenda-se revisar critérios ou incluir mais variáveis."
+        )
+
+if alertas:
+    for alerta in alertas:
+        st.warning(f"⚠️ {alerta}")
+else:
+    st.success("✅ Nenhum alerta crítico encontrado.")
+
+
+# =====================================================
+# METODOLOGIA
+# =====================================================
+with st.expander("🧮 Metodologia aplicada"):
+    st.markdown("""
+    ## Método AHP-Gaussiano
+
+    ### 1. Matriz de decisão
+
+    Cada produto é uma alternativa e cada coluna numérica é um critério.
+
+    ### 2. Direção de preferência
+
+    Critérios podem ser:
+
+    - **Maior é melhor**
+    - **Menor é melhor**
+
+    Para critérios de minimização, a aplicação converte o valor usando:
+
+    ```text
+    x' = 1 / x
+    ```
+
+    ### 3. Normalização
+
+    Cada critério é normalizado por soma:
+
+    ```text
+    rᵢⱼ = xᵢⱼ / Σxᵢⱼ
+    ```
+
+    ### 4. Média normalizada
+
+    ```text
+    μⱼ = média dos valores normalizados do critério j
+    ```
+
+    ### 5. Desvio padrão amostral
+
+    ```text
+    σⱼ = desvio padrão amostral dos valores normalizados do critério j
+    ```
+
+    ### 6. Fator Gaussiano
+
+    ```text
+    FGⱼ = σⱼ / μⱼ
+    ```
+
+    ### 7. Peso normalizado do critério
+
+    ```text
+    wⱼ = FGⱼ / ΣFGⱼ
+    ```
+
+    ### 8. Pontuação final
+
+    ```text
+    Sᵢ = Σ(rᵢⱼ × wⱼ)
+    ```
+
+    A alternativa com maior `Sᵢ` recebe a primeira posição no ranking.
+    """)
 
 
 # =====================================================
 # RODAPÉ
 # =====================================================
 st.markdown("---")
-
 st.caption(
-    "🎓 Aplicação acadêmica | Método AHP Gaussiano | Decisão multicritério com Pontuação integrada"
+    "Aplicação acadêmica | Método AHP-Gaussiano | Decisão multicritério"
 )
